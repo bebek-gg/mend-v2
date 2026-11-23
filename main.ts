@@ -713,10 +713,14 @@ function searchReplaceEdits(lines: string[], strict: boolean): Edit[] {
     }
     if (path === null) path = prevPath;
     if (path === null) throw new ParseError(`error: parse ${searchLine}`);
-    // Find ======= after SEARCH, stopping at another SEARCH line.
+    // Find ======= after SEARCH, stopping at another SEARCH line or at a
+    // >>>>>>> REPLACE line: a block whose >>>>>>> comes before its =======
+    // is a parse error (section 7: a SEARCH line with no ======= and then
+    // >>>>>>> REPLACE after it).
     let eq = -1;
     for (let k = i + 1; k < lines.length; k += 1) {
       if ((lines[k] as string).trimEnd() === '<<<<<<< SEARCH') break;
+      if ((lines[k] as string).trimEnd() === '>>>>>>> REPLACE') break;
       if ((lines[k] as string).trimEnd() === '=======') {
         eq = k;
         break;
@@ -812,8 +816,9 @@ function buildVChunk(anchor: string | null, body: string[], eof: boolean): VChun
   return { anchor, o, n, isCtx, ctxAt, eof };
 }
 
-/** Read a patch's V4A edits (section 8). */
-function v4aEdits(lines: string[]): Edit[] {
+/** Read a patch's V4A edits (section 8). With --strict only tier 0 is tried
+ * for anchors and chunk matches (section 5). */
+function v4aEdits(lines: string[], strict: boolean): Edit[] {
   const first = lines.findIndex((l) => !isBlank(l));
   if (first < 0) throw new ParseError('error: parse 1');
   if ((lines[first] as string).trim() !== '*** Begin Patch') {
@@ -876,6 +881,10 @@ function v4aEdits(lines: string[]): Edit[] {
       let chunkBody: string[] = [];
       let chunkEof = false;
       let inChunk = false;
+      // Section 8: a chunk starts at an @@ line or, for the first chunk,
+      // at a body line. Once a chunk has been seen, a later body line
+      // cannot start another chunk.
+      let seenChunk = false;
       const flush = (): void => {
         if (!inChunk) return;
         chunks.push(buildVChunk(chunkAnchor, chunkBody, chunkEof));
@@ -893,6 +902,7 @@ function v4aEdits(lines: string[]): Edit[] {
           chunkBody = [];
           chunkEof = false;
           inChunk = true;
+          seenChunk = true;
           i += 1;
           continue;
         }
@@ -905,10 +915,19 @@ function v4aEdits(lines: string[]): Edit[] {
         }
         if (b === '' || b[0] === ' ' || b[0] === '-' || b[0] === '+') {
           if (!inChunk) {
+            // A blank line after a chunk has ended is a trailing blank of
+            // the section, not a new chunk (section 8).
+            if (seenChunk && b === '') {
+              i += 1;
+              continue;
+            }
+            // A non-empty body line may only start the first chunk.
+            if (seenChunk) throw new ParseError(`error: parse ${i + 1}`);
             chunkAnchor = null;
             chunkBody = [];
             chunkEof = false;
             inChunk = true;
+            seenChunk = true;
           }
           chunkBody.push(b);
           i += 1;
@@ -963,9 +982,10 @@ function v4aEdits(lines: string[]): Edit[] {
       for (const ch of sec.chunks) {
         if (ch.anchor !== null) {
           // Find the first line at or after the cursor equal to the anchor,
-          // at the first tier where one is.
+          // at the first tier where one is. With --strict only tier 0.
           let foundAt = -1;
-          for (let tier = 0; tier <= 2; tier += 1) {
+          const maxTier = strict ? 0 : 2;
+          for (let tier = 0; tier <= maxTier; tier += 1) {
             const key = tierKey(ch.anchor, tier);
             for (let k = cursor; k < cur.length; k += 1) {
               if (tierKey(cur[k] as string, tier) === key) {
@@ -986,9 +1006,10 @@ function v4aEdits(lines: string[]): Edit[] {
         }
         // Find O's first occurrence at or after the cursor, at the first
         // tier with one; an end-of-file chunk takes only one that ends at
-        // the file's last line.
+        // the file's last line. With --strict only tier 0 is tried.
         let pick: { tier: number; at: number } | null = null;
-        for (let tier = 0; tier <= 2; tier += 1) {
+        const maxTier = strict ? 0 : 2;
+        for (let tier = 0; tier <= maxTier; tier += 1) {
           const at = occurrencesAt(cur, ch.o, tier).filter((pos) => pos >= cursor);
           if (ch.eof) {
             const end = at.filter((pos) => pos + ch.o.length === cur.length);
@@ -1058,7 +1079,7 @@ function run(args: string[]): { code: number; out: string[] } {
     if (kind === 'json') edits = jsonEdits(text, lines);
     else if (kind === 'unified') edits = unifiedEdits(lines, strict);
     else if (kind === 'search-replace') edits = searchReplaceEdits(lines, strict);
-    else edits = v4aEdits(lines);
+    else edits = v4aEdits(lines, strict);
     if (edits.length === 0) throw new ParseError('error: parse 1');
   } catch (e) {
     if (e instanceof ParseError) return { code: 2, out: [e.line] };
